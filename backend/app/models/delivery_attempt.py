@@ -1,7 +1,7 @@
 import enum
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Integer, DateTime, Text, ForeignKey, JSON, Enum
+from sqlalchemy import Column, String, Integer, DateTime, Text, ForeignKey, JSON, Enum, UniqueConstraint
 from sqlalchemy.orm import relationship
 from app.database.session import Base
 
@@ -11,8 +11,10 @@ def get_utc_now():
 
 
 class AttemptStatus(str, enum.Enum):
+    STARTED = "STARTED"
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
 
 
 class DeliveryAttempt(Base):
@@ -24,7 +26,9 @@ class DeliveryAttempt(Base):
     
     status = Column(
         Enum(AttemptStatus, name="attempt_status_enum", native_enum=False),
-        nullable=False
+        default=AttemptStatus.STARTED,
+        nullable=False,
+        index=True,
     )
     http_status = Column(Integer, nullable=True)
     response_time_ms = Column(Integer, nullable=True)
@@ -33,6 +37,10 @@ class DeliveryAttempt(Base):
     response_body = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
     executed_at = Column(DateTime(timezone=True), default=get_utc_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("delivery_id", "attempt_number", name="uq_delivery_attempts_delivery_attempt_number"),
+    )
 
     # Relationship
     delivery = relationship("Delivery", back_populates="attempts")

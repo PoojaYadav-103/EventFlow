@@ -17,11 +17,27 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: Optional[str] = None
     CELERY_TASK_ALWAYS_EAGER: bool = False  # Set to True for synchronous testing/dev
     
-    # Webhook Delivery Settings
-    DEFAULT_TIMEOUT_SECONDS: float = 10.0
+    # Webhook Delivery Settings (Module 2 Reliability)
     MAX_DELIVERY_ATTEMPTS: int = 5
-    BASE_BACKOFF_SECONDS: float = 5.0
-    MAX_BACKOFF_SECONDS: float = 3600.0
+    RETRY_BASE_DELAY: float = 5.0
+    RETRY_MAX_DELAY: float = 3600.0
+    RETRY_JITTER: float = 2.0
+    WEBHOOK_TIMEOUT: float = 10.0
+    LEASE_DURATION_SECONDS: float = 30.0
+    RETRYABLE_STATUS_CODES: List[int] = [408, 425, 429, 500, 502, 503, 504]
+
+    # Backward compatibility aliases
+    @property
+    def BASE_BACKOFF_SECONDS(self) -> float:
+        return self.RETRY_BASE_DELAY
+
+    @property
+    def MAX_BACKOFF_SECONDS(self) -> float:
+        return self.RETRY_MAX_DELAY
+
+    @property
+    def DEFAULT_TIMEOUT_SECONDS(self) -> float:
+        return self.WEBHOOK_TIMEOUT
     
     # Security & SSRF
     ALLOW_INTERNAL_NETWORKS: bool = True  # Allows localhost/internal IPs in development

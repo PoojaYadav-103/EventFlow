@@ -1,7 +1,7 @@
 import enum
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Integer, DateTime, Text, ForeignKey, UniqueConstraint, Enum
+from sqlalchemy import Column, String, Integer, DateTime, Text, ForeignKey, UniqueConstraint, Enum, Index
 from sqlalchemy.orm import relationship
 from app.database.session import Base
 
@@ -46,6 +46,8 @@ class Delivery(Base):
 
     __table_args__ = (
         UniqueConstraint("event_id", "endpoint_id", name="uq_delivery_event_endpoint"),
+        Index("ix_deliveries_status_lease_expires", "status", "lease_expires_at"),
+        Index("ix_deliveries_status_next_retry", "status", "next_retry_at"),
     )
 
     # Relationships

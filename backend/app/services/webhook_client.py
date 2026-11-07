@@ -1,11 +1,108 @@
+import enum
+import email.utils
 import json
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 import httpx
 
 from app.core.config import settings
 from app.core.security import sign_payload
 from app.core.ssrf import validate_webhook_url, SSRFProtectionError
+
+
+class HTTPOutcome(str, enum.Enum):
+    SUCCESS = "SUCCESS"
+    RETRYABLE_FAILURE = "RETRYABLE_FAILURE"
+    PERMANENT_FAILURE = "PERMANENT_FAILURE"
+
+
+def sanitize_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Redact sensitive headers (Authorization, Cookie, complete signatures)."""
+    if not headers:
+        return {}
+    sensitive_keys = {"authorization", "cookie", "set-cookie", "proxy-authorization"}
+    sanitized = {}
+    for k, v in headers.items():
+        lower_k = k.lower()
+        if lower_k in sensitive_keys:
+            sanitized[k] = "[REDACTED]"
+        elif lower_k == "x-eventflow-signature" and len(v) > 20:
+            parts = v.split("v1=")
+            if len(parts) == 2:
+                prefix = parts[0] + "v1="
+                digest = parts[1]
+                sanitized[k] = f"{prefix}{digest[:6]}...{digest[-4:]}"
+            else:
+                sanitized[k] = "[REDACTED]"
+        else:
+            sanitized[k] = v
+    return sanitized
+
+
+def parse_retry_after(header_value: Optional[str], max_delay: float) -> Optional[float]:
+    """
+    Parses Retry-After header supporting:
+    1. Integer/float delay-seconds (e.g. "120")
+    2. RFC 7231 / RFC 2822 HTTP-date (e.g. "Wed, 21 Oct 2026 07:28:00 GMT")
+    Returns capped seconds or None if missing/invalid.
+    """
+    if not header_value or not str(header_value).strip():
+        return None
+    val = str(header_value).strip()
+
+    # 1. Decimal or integer seconds
+    try:
+        seconds = float(val)
+        if seconds > 0:
+            return round(min(max_delay, seconds), 2)
+        return None
+    except ValueError:
+        pass
+
+    # 2. HTTP-Date
+    try:
+        dt = email.utils.parsedate_to_datetime(val)
+        if dt is not None:
+            now = datetime.now(timezone.utc)
+            delta = (dt - now).total_seconds()
+            if delta > 0:
+                return round(min(max_delay, delta), 2)
+    except Exception:
+        pass
+
+    return None
+
+
+def classify_webhook_outcome(
+    http_status: Optional[int],
+    error_message: Optional[str] = None,
+    is_timeout: bool = False,
+    is_connection_error: bool = False,
+    is_ssrf_error: bool = False,
+) -> HTTPOutcome:
+    """
+    Centralized HTTP retry policy:
+    - HTTP 2xx -> SUCCESS
+    - Network drops, timeouts, HTTP 408, 425, 429, 5xx -> RETRYABLE_FAILURE
+    - Other HTTP 4xx, SSRF blocks -> PERMANENT_FAILURE
+    """
+    if is_ssrf_error:
+        return HTTPOutcome.PERMANENT_FAILURE
+
+    if is_timeout or is_connection_error:
+        return HTTPOutcome.RETRYABLE_FAILURE
+
+    if http_status is None:
+        return HTTPOutcome.PERMANENT_FAILURE
+
+    if 200 <= http_status < 300:
+        return HTTPOutcome.SUCCESS
+
+    if http_status in settings.RETRYABLE_STATUS_CODES:
+        return HTTPOutcome.RETRYABLE_FAILURE
+
+    return HTTPOutcome.PERMANENT_FAILURE
 
 
 class WebhookExecutionResult:
@@ -18,14 +115,26 @@ class WebhookExecutionResult:
         response_headers: Optional[Dict[str, str]] = None,
         response_body: Optional[str] = None,
         error_message: Optional[str] = None,
+        outcome: Optional[HTTPOutcome] = None,
+        retry_after_seconds: Optional[float] = None,
     ):
         self.success = success
         self.http_status = http_status
         self.response_time_ms = response_time_ms
-        self.request_headers = request_headers
-        self.response_headers = response_headers or {}
+        self.request_headers = sanitize_headers(request_headers)
+        self.response_headers = sanitize_headers(response_headers or {})
         self.response_body = response_body
         self.error_message = error_message
+        self.retry_after_seconds = retry_after_seconds
+        
+        if outcome is not None:
+            self.outcome = outcome
+        elif success:
+            self.outcome = HTTPOutcome.SUCCESS
+        elif http_status in settings.RETRYABLE_STATUS_CODES or http_status is None:
+            self.outcome = HTTPOutcome.RETRYABLE_FAILURE
+        else:
+            self.outcome = HTTPOutcome.PERMANENT_FAILURE
 
 
 def execute_webhook_request(
@@ -40,10 +149,11 @@ def execute_webhook_request(
 ) -> WebhookExecutionResult:
     """
     Executes a webhook HTTP POST request with HMAC-SHA256 signing,
-    SSRF validation, latency measurement, and robust error handling.
+    SSRF validation, genuine overall HTTP timeout deadline, Retry-After extraction,
+    and outcome classification.
     """
     if timeout_seconds is None:
-        timeout_seconds = settings.DEFAULT_TIMEOUT_SECONDS
+        timeout_seconds = settings.WEBHOOK_TIMEOUT
 
     # 1. SSRF validation check
     try:
@@ -54,7 +164,8 @@ def execute_webhook_request(
             http_status=None,
             response_time_ms=0,
             request_headers={},
-            error_message=f"SSRF Protection blocked request: {str(e)}"
+            error_message=f"SSRF Protection blocked request: {str(e)}",
+            outcome=HTTPOutcome.PERMANENT_FAILURE,
         )
 
     # 2. Serialize payload & sign
@@ -71,24 +182,38 @@ def execute_webhook_request(
         "X-EventFlow-Signature": sig_header,
     }
 
+    # Strict overall deadline configuration
+    timeout_cfg = httpx.Timeout(
+        timeout=timeout_seconds,
+        connect=min(5.0, timeout_seconds),
+        read=timeout_seconds,
+        write=timeout_seconds,
+        pool=timeout_seconds,
+    )
+
     start_time = time.perf_counter()
     try:
-        with httpx.Client(timeout=timeout_seconds, follow_redirects=False) as client:
+        with httpx.Client(timeout=timeout_cfg, follow_redirects=False) as client:
             resp = client.post(
                 validated_url,
                 content=payload_str,
                 headers=headers,
             )
             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-            
-            # Truncate response body if needed (prevent DB overflow)
+
             resp_body_preview = resp.text[:4096] if resp.text else ""
             resp_headers = dict(resp.headers)
             
-            # Consider 2xx as success
-            is_success = 200 <= resp.status_code < 300
+            # Inspect Retry-After header for 429 and 503
+            retry_after_sec = None
+            if resp.status_code in (429, 503):
+                retry_after_header = resp.headers.get("retry-after")
+                retry_after_sec = parse_retry_after(retry_after_header, settings.RETRY_MAX_DELAY)
+
+            outcome = classify_webhook_outcome(resp.status_code)
+            is_success = (outcome == HTTPOutcome.SUCCESS)
             error_msg = None if is_success else f"HTTP Error {resp.status_code}: {resp.reason_phrase}"
-            
+
             return WebhookExecutionResult(
                 success=is_success,
                 http_status=resp.status_code,
@@ -97,7 +222,10 @@ def execute_webhook_request(
                 response_headers=resp_headers,
                 response_body=resp_body_preview,
                 error_message=error_msg,
+                outcome=outcome,
+                retry_after_seconds=retry_after_sec,
             )
+
     except httpx.TimeoutException:
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
         return WebhookExecutionResult(
@@ -105,7 +233,8 @@ def execute_webhook_request(
             http_status=None,
             response_time_ms=elapsed_ms,
             request_headers=headers,
-            error_message=f"Request timed out after {timeout_seconds}s"
+            error_message=f"Request timed out after {timeout_seconds}s total deadline",
+            outcome=HTTPOutcome.RETRYABLE_FAILURE,
         )
     except httpx.ConnectError as e:
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
@@ -114,7 +243,8 @@ def execute_webhook_request(
             http_status=None,
             response_time_ms=elapsed_ms,
             request_headers=headers,
-            error_message=f"Connection failed: {str(e)}"
+            error_message=f"Connection failed: {str(e)}",
+            outcome=HTTPOutcome.RETRYABLE_FAILURE,
         )
     except Exception as e:
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
@@ -123,5 +253,6 @@ def execute_webhook_request(
             http_status=None,
             response_time_ms=elapsed_ms,
             request_headers=headers,
-            error_message=f"Unexpected error: {type(e).__name__} - {str(e)}"
+            error_message=f"Unexpected network/client error: {type(e).__name__} - {str(e)}",
+            outcome=HTTPOutcome.RETRYABLE_FAILURE,
         )

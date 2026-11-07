@@ -32,4 +32,8 @@ celery_app.conf.beat_schedule = {
         "task": "app.workers.tasks.sweep_retries_task",
         "schedule": 10.0,  # Sweeps overdue retries every 10 seconds
     },
+    "stuck-deliveries-reaper": {
+        "task": "app.workers.tasks.reap_stuck_deliveries_task",
+        "schedule": 15.0,  # Sweeps expired worker leases every 15 seconds
+    },
 }

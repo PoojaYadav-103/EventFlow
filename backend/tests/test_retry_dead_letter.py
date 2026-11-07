@@ -41,6 +41,10 @@ def test_dead_letter_on_exhausted_retries(client, db_session):
     with patch("app.services.delivery_service.execute_webhook_request", return_value=mock_fail_result):
         # Already 1 attempt made. Run 4 more attempts:
         for _ in range(4):
+            # Advance scheduled time for retry
+            d = db_session.query(Delivery).filter(Delivery.id == delivery_id).first()
+            d.next_retry_at = None
+            db_session.commit()
             DeliveryService.execute_delivery(db_session, delivery_id)
 
     # Fetch updated delivery
@@ -85,6 +89,10 @@ def test_retry_failed_delivery_and_succeed(client, db_session):
     assert deliv["attempt_count"] == 1
 
     # Second attempt succeeds!
+    d = db_session.query(Delivery).filter(Delivery.id == delivery_id).first()
+    d.next_retry_at = None
+    db_session.commit()
+
     mock_success_result = WebhookExecutionResult(
         success=True,
         http_status=200,
@@ -145,6 +153,9 @@ def test_manual_retry_action(client, db_session):
     # 2. Drive delivery to DEAD_LETTER state by exhausting max_attempts
     with patch("app.services.delivery_service.execute_webhook_request", return_value=mock_fail_result):
         for _ in range(4):
+            d = db_session.query(Delivery).filter(Delivery.id == delivery_id).first()
+            d.next_retry_at = None
+            db_session.commit()
             DeliveryService.execute_delivery(db_session, delivery_id)
 
     deliv_dead = client.get(f"/api/v1/deliveries/{delivery_id}").json()
@@ -175,11 +186,15 @@ def test_manual_retry_action(client, db_session):
         processed = sweep_outbox_task()
         assert processed == 1
 
-    # 6. Verify delivery reached SUCCESS and attempts history is preserved (5 failures + 1 success = 6 attempts)
+    # 6. Verify delivery reached SUCCESS and attempts history is preserved:
+    # In Module 2: attempt_count tracks active cycle (reset to 0 on manual retry -> 1 on success)
+    # Total historical attempts = 5 (cycle 1) + 1 (cycle 2) = 6
+    db_session.expire_all()
     detail_resp = client.get(f"/api/v1/deliveries/{delivery_id}").json()
     assert detail_resp["status"] == "SUCCESS"
-    assert detail_resp["attempt_count"] == 6
+    assert detail_resp["attempt_count"] == 1
     assert len(detail_resp["attempts"]) == 6
+    assert detail_resp["attempts"][-1]["attempt_number"] == 6
 
     # 7. SUCCESS delivery must also reject manual retry with 409
     success_retry_resp = client.post(f"/api/v1/deliveries/{delivery_id}/retry")

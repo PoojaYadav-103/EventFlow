@@ -62,7 +62,7 @@ export interface DeliveryAttempt {
   id: string;
   delivery_id: string;
   attempt_number: number;
-  status: 'SUCCESS' | 'FAILED';
+  status: 'STARTED' | 'SUCCESS' | 'FAILED' | 'UNKNOWN';
   http_status?: number;
   response_time_ms?: number;
   request_headers?: Record<string, string>;

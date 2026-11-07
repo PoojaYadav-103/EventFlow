@@ -71,7 +71,45 @@ E-Commerce Simulator / API Client
 
 ---
 
-## Getting Started
+## Milestone 2: Reliability Engineering
+
+Module 2 hardens EventFlow with distributed systems concurrency, lease fencing, and crash-resilient attempt reconciliation:
+
+1. **Atomic Worker Leasing & Concurrency Fencing**:
+   - Deliveries are claimed using `FOR UPDATE OF deliveries SKIP LOCKED`.
+   - Each worker claims a delivery by generating a unique `lease_token` (UUIDv4), associating `lease_worker_id`, and setting `lease_expires_at = NOW() + 30s`.
+   - Guard against premature retry execution: worker claim validates `next_retry_at IS NULL OR next_retry_at <= NOW()`.
+   - Post-HTTP CAS fencing check (`WHERE id = :id AND lease_token = :token AND lease_expires_at > NOW()`). If lease expired or reclaimed, worker is fenced off and cannot mutate `deliveries`.
+
+2. **Pre-flight 3-Phase Attempt Tracking**:
+   - Worker pre-flight commits `DeliveryAttempt(status=STARTED)` to the database **before** opening the HTTP socket.
+   - If a worker process crashes or is killed during network I/O, the attempt record is guaranteed to exist.
+
+3. **Crash Recovery Reaper (`reap_stuck_deliveries_task`)**:
+   - Periodic Celery Beat task (every 15s) queries `deliveries` WHERE `status = 'PROCESSING' AND lease_expires_at <= NOW()` with `FOR UPDATE SKIP LOCKED`.
+   - Reconciles orphaned `STARTED` attempts to `UNKNOWN` with audit metadata (`[CRASH REAPER]`).
+   - Transitions deliveries to `RETRYING` (with backoff + OutboxEvent) or `DEAD_LETTER` if max attempts are exhausted.
+
+4. **Stale Worker Late Completion Reconciliation**:
+   - If Worker A experiences a network delay exceeding its lease duration, the Crash Reaper reclaims the delivery and assigns it to Worker B.
+   - When Worker A's slow HTTP request eventually arrives, Worker A's CAS check fails.
+   - Worker A **never mutates the `deliveries` table**.
+   - Worker A reconciles its own attempt (`STARTED` → `UNKNOWN` → `SUCCESS` or `FAILED`) with an audit trail note (`[STALE WORKER RECONCILIATION]`).
+
+5. **Exponential Backoff with Full Jitter & Retry-After**:
+   - Formula: $\text{delay} = \min(\text{max\_delay}, \text{base} \times 2^{\text{attempt}-1}) + \text{uniform}(0, \text{jitter})$
+   - Standard defaults: Base = 5.0s, Max = 3600.0s, Jitter = 2.0s.
+   - Respects receiver `Retry-After` headers on HTTP 429 and 503 (supports delay-seconds and RFC 7231 HTTP-date).
+
+6. **Sequential Attempt Tracking vs. Active Retry Quotas**:
+   - `deliveries.attempt_count`: Tracks attempts within the *active* retry cycle (1 ... 5). Reset to 0 on manual retry to grant a fresh automatic cycle quota.
+   - `delivery_attempts.attempt_number`: Globally sequential counter ($1, 2, 3, 4, 5, 6 \dots$) preserved across all manual retry cycles with composite uniqueness constraint `(delivery_id, attempt_number)`.
+
+7. **Universal Transactional Outbox Invariant**:
+   - Initial dispatch, automatic retries, and manual retries **all** dispatch strictly via the PostgreSQL transactional outbox.
+   - Manual retry route `POST /api/v1/deliveries/{id}/retry` creates an `OutboxEvent` within the exact same database transaction that resets delivery state.
+
+---
 
 ### Option A: Running with Docker Compose (Recommended)
 

@@ -50,6 +50,18 @@ def test_alembic_migration_upgrade_and_downgrade():
         delivery_indexes = {idx["name"]: idx for idx in inspector.get_indexes("deliveries")}
         assert any("lease_expires_at" in idx["column_names"] for idx in delivery_indexes.values()), \
             "Missing index on deliveries.lease_expires_at"
+        assert "ix_deliveries_status_lease_expires" in delivery_indexes or any(
+            set(idx["column_names"]) == {"status", "lease_expires_at"} for idx in delivery_indexes.values()
+        ), "Missing composite index on deliveries(status, lease_expires_at)"
+
+        # Verify unique constraint on delivery_attempts (delivery_id, attempt_number)
+        attempt_unique = inspector.get_unique_constraints("delivery_attempts")
+        assert any(
+            set(u["column_names"]) == {"delivery_id", "attempt_number"} for u in attempt_unique
+        ) or any(
+            set(idx["column_names"]) == {"delivery_id", "attempt_number"} and idx.get("unique")
+            for idx in inspector.get_indexes("delivery_attempts")
+        ), "Missing unique constraint on delivery_attempts(delivery_id, attempt_number)"
 
         # 4. Downgrade to base
         command.downgrade(config, "base")

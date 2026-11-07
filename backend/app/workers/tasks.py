@@ -140,3 +140,26 @@ def sweep_retries_task():
         raise exc
     finally:
         db.close()
+
+
+@celery_app.task(name="app.workers.tasks.reap_stuck_deliveries_task")
+def reap_stuck_deliveries_task():
+    """
+    Periodic crash recovery reaper:
+    Scans for deliveries stuck in PROCESSING with expired worker leases (lease_expires_at <= NOW()).
+    Reconciles orphaned STARTED attempts to UNKNOWN.
+    Safely transitions deliveries to RETRYING (with exponential backoff and new OutboxEvent)
+    or DEAD_LETTER if max attempts are exhausted.
+    """
+    db = SessionLocal()
+    try:
+        reaped_count = DeliveryService.reap_stuck_deliveries(db)
+        if reaped_count > 0:
+            logger.info(f"Reaped and recovered {reaped_count} stuck delivery lease(s).")
+        return reaped_count
+    except Exception as exc:
+        db.rollback()
+        logger.error(f"Error in reap_stuck_deliveries_task: {exc}", exc_info=True)
+        raise exc
+    finally:
+        db.close()

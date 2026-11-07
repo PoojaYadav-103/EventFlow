@@ -45,12 +45,16 @@ export const DeliveriesPage: React.FC<DeliveriesPageProps> = ({ refreshTrigger }
   }, [statusFilter, refreshTrigger]);
 
   const handleManualRetry = async (delId: string) => {
+    if (!window.confirm("Trigger manual retry for this delivery? A fresh delivery task will be enqueued via transactional outbox.")) {
+      return;
+    }
     setRetryingId(delId);
     try {
       await api.retryDelivery(delId);
-      fetchDeliveries();
+      await fetchDeliveries();
     } catch (err: any) {
-      alert(`Retry failed: ${err.message}`);
+      const errorDetail = err.response?.data?.detail || err.message;
+      alert(`Manual Retry Conflict / Error: ${errorDetail}`);
     } finally {
       setRetryingId(null);
     }
@@ -266,10 +270,7 @@ export const DeliveriesPage: React.FC<DeliveriesPageProps> = ({ refreshTrigger }
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
                             <span className="font-semibold text-white">Attempt #{att.attempt_number}</span>
-                            <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${att.status === 'SUCCESS' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'
-                              }`}>
-                              {att.status}
-                            </span>
+                            <StatusBadge status={att.status} />
                             {att.http_status && (
                               <span className="text-slate-400 font-mono text-[11px]">
                                 HTTP {att.http_status}
@@ -282,7 +283,13 @@ export const DeliveriesPage: React.FC<DeliveriesPageProps> = ({ refreshTrigger }
                         </div>
 
                         {att.error_message && (
-                          <div className="p-2 rounded bg-rose-950/30 border border-rose-900/40 text-rose-300 text-[11px]">
+                          <div className={`p-2 rounded text-[11px] ${
+                            att.error_message.includes('[STALE WORKER RECONCILIATION]')
+                              ? 'bg-amber-950/30 border border-amber-900/40 text-amber-300'
+                              : att.error_message.includes('[CRASH REAPER]')
+                              ? 'bg-purple-950/30 border border-purple-900/40 text-purple-300'
+                              : 'bg-rose-950/30 border border-rose-900/40 text-rose-300'
+                          }`}>
                             {att.error_message}
                           </div>
                         )}
