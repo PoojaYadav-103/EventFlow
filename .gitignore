@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+*.db
+*.sqlite3
+.pytest_cache/
+
+# Node & Frontend
+node_modules/
+dist/
+.pnpm-store/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Frontend build
+frontend/dist/
+
+# Celery
+celerybeat-schedule*
+
+# Test coverage
+.coverage
+htmlcov/
