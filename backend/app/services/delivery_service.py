@@ -41,8 +41,8 @@ class DeliveryService:
         Calculate delay for next retry attempt.
         If retry_after_seconds is provided (e.g. from HTTP 429/503 Retry-After header),
         respect it (bounded by settings.RETRY_MAX_DELAY).
-        Otherwise, calculate exponential backoff with full jitter:
-        delay = min(max_delay, base * 2^(attempt - 1)) + uniform(0, jitter)
+        Otherwise, calculate exponential backoff with uniform additive jitter:
+        delay = min(max_delay, min(max_delay, base * 2^(attempt - 1)) + uniform(0, jitter))
         """
         if retry_after_seconds is not None and retry_after_seconds > 0:
             return round(min(settings.RETRY_MAX_DELAY, float(retry_after_seconds)), 2)

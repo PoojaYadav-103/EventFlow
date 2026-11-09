@@ -18,8 +18,8 @@ from app.services.webhook_client import (
 )
 
 
-def test_exponential_backoff_with_jitter():
-    """Verify exponential backoff calculation and jitter bounds."""
+def test_exponential_backoff_with_uniform_additive_jitter():
+    """Verify exponential backoff calculation with uniform additive jitter bounds."""
     # Attempt 1: min(3600, 5 * 2^0) + uniform(0, 2) => [5.0, 7.0]
     for _ in range(20):
         delay = DeliveryService.calculate_backoff(1)

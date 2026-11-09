@@ -96,9 +96,10 @@ Module 2 hardens EventFlow with distributed systems concurrency, lease fencing, 
    - Worker A **never mutates the `deliveries` table**.
    - Worker A reconciles its own attempt (`STARTED` → `UNKNOWN` → `SUCCESS` or `FAILED`) with an audit trail note (`[STALE WORKER RECONCILIATION]`).
 
-5. **Exponential Backoff with Full Jitter & Retry-After**:
-   - Formula: $\text{delay} = \min(\text{max\_delay}, \text{base} \times 2^{\text{attempt}-1}) + \text{uniform}(0, \text{jitter})$
+5. **Exponential Backoff with Uniform Additive Jitter & Retry-After**:
+   - Formula: $\text{delay} = \min(\text{max\_delay}, \min(\text{max\_delay}, \text{base} \times 2^{\text{attempt}-1}) + \text{uniform}(0, \text{jitter}))$
    - Standard defaults: Base = 5.0s, Max = 3600.0s, Jitter = 2.0s.
+   - Uniform additive jitter spreads retry spikes evenly across concurrent clients to avoid thundering herds.
    - Respects receiver `Retry-After` headers on HTTP 429 and 503 (supports delay-seconds and RFC 7231 HTTP-date).
 
 6. **Sequential Attempt Tracking vs. Active Retry Quotas**:

@@ -1,3 +1,5 @@
+import asyncio
+import concurrent.futures
 import enum
 import email.utils
 import json
@@ -137,6 +139,51 @@ class WebhookExecutionResult:
             self.outcome = HTTPOutcome.PERMANENT_FAILURE
 
 
+def _run_with_overall_deadline(coro_fn, *args, **kwargs):
+    """
+    Safely executes an async coroutine from synchronous worker threads or active event loops.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(lambda: asyncio.run(coro_fn(*args, **kwargs))).result()
+    else:
+        return asyncio.run(coro_fn(*args, **kwargs))
+
+
+async def _async_http_post(
+    url: str,
+    payload_str: str,
+    headers: Dict[str, str],
+    timeout_seconds: float,
+) -> Tuple[int, str, Dict[str, str], str]:
+    """
+    Executes async HTTP POST under an explicit, cancellable asyncio wall-clock deadline.
+    Guarantees immediate task cancellation and TCP socket teardown if the total
+    wall-clock duration exceeds timeout_seconds (e.g. slowloris / slow-trickle stream).
+    """
+    socket_timeout = httpx.Timeout(
+        timeout=timeout_seconds,
+        connect=min(5.0, timeout_seconds),
+        read=timeout_seconds,
+        write=timeout_seconds,
+        pool=timeout_seconds,
+    )
+    async with asyncio.timeout(timeout_seconds):
+        async with httpx.AsyncClient(timeout=socket_timeout, follow_redirects=False) as client:
+            resp = await client.post(
+                url,
+                content=payload_str,
+                headers=headers,
+            )
+            body_preview = resp.text[:4096] if resp.text else ""
+            return resp.status_code, resp.reason_phrase, dict(resp.headers), body_preview
+
+
 def execute_webhook_request(
     url: str,
     secret: str,
@@ -149,11 +196,15 @@ def execute_webhook_request(
 ) -> WebhookExecutionResult:
     """
     Executes a webhook HTTP POST request with HMAC-SHA256 signing,
-    SSRF validation, genuine overall HTTP timeout deadline, Retry-After extraction,
+    SSRF validation, genuine cancellable overall HTTP deadline, Retry-After extraction,
     and outcome classification.
     """
     if timeout_seconds is None:
         timeout_seconds = settings.WEBHOOK_TIMEOUT
+
+    # Enforce overall wall-clock deadline strictly shorter than the delivery lease duration
+    max_safe_deadline = max(1.0, settings.LEASE_DURATION_SECONDS - 5.0)
+    effective_timeout = min(float(timeout_seconds), max_safe_deadline)
 
     # 1. SSRF validation check
     try:
@@ -182,58 +233,50 @@ def execute_webhook_request(
         "X-EventFlow-Signature": sig_header,
     }
 
-    # Strict overall deadline configuration
-    timeout_cfg = httpx.Timeout(
-        timeout=timeout_seconds,
-        connect=min(5.0, timeout_seconds),
-        read=timeout_seconds,
-        write=timeout_seconds,
-        pool=timeout_seconds,
-    )
-
     start_time = time.perf_counter()
     try:
-        with httpx.Client(timeout=timeout_cfg, follow_redirects=False) as client:
-            resp = client.post(
-                validated_url,
-                content=payload_str,
-                headers=headers,
+        status_code, reason_phrase, resp_headers, resp_body_preview = _run_with_overall_deadline(
+            _async_http_post,
+            validated_url,
+            payload_str,
+            headers,
+            effective_timeout,
+        )
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+
+        # Inspect Retry-After header for 429 and 503
+        retry_after_sec = None
+        if status_code in (429, 503):
+            retry_after_header = next(
+                (v for k, v in resp_headers.items() if k.lower() == "retry-after"),
+                None,
             )
-            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+            retry_after_sec = parse_retry_after(retry_after_header, settings.RETRY_MAX_DELAY)
 
-            resp_body_preview = resp.text[:4096] if resp.text else ""
-            resp_headers = dict(resp.headers)
-            
-            # Inspect Retry-After header for 429 and 503
-            retry_after_sec = None
-            if resp.status_code in (429, 503):
-                retry_after_header = resp.headers.get("retry-after")
-                retry_after_sec = parse_retry_after(retry_after_header, settings.RETRY_MAX_DELAY)
+        outcome = classify_webhook_outcome(status_code)
+        is_success = (outcome == HTTPOutcome.SUCCESS)
+        error_msg = None if is_success else f"HTTP Error {status_code}: {reason_phrase}"
 
-            outcome = classify_webhook_outcome(resp.status_code)
-            is_success = (outcome == HTTPOutcome.SUCCESS)
-            error_msg = None if is_success else f"HTTP Error {resp.status_code}: {resp.reason_phrase}"
+        return WebhookExecutionResult(
+            success=is_success,
+            http_status=status_code,
+            response_time_ms=elapsed_ms,
+            request_headers=headers,
+            response_headers=resp_headers,
+            response_body=resp_body_preview,
+            error_message=error_msg,
+            outcome=outcome,
+            retry_after_seconds=retry_after_sec,
+        )
 
-            return WebhookExecutionResult(
-                success=is_success,
-                http_status=resp.status_code,
-                response_time_ms=elapsed_ms,
-                request_headers=headers,
-                response_headers=resp_headers,
-                response_body=resp_body_preview,
-                error_message=error_msg,
-                outcome=outcome,
-                retry_after_seconds=retry_after_sec,
-            )
-
-    except httpx.TimeoutException:
+    except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException):
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
         return WebhookExecutionResult(
             success=False,
             http_status=None,
             response_time_ms=elapsed_ms,
             request_headers=headers,
-            error_message=f"Request timed out after {timeout_seconds}s total deadline",
+            error_message=f"Request timed out after {effective_timeout}s total deadline",
             outcome=HTTPOutcome.RETRYABLE_FAILURE,
         )
     except httpx.ConnectError as e:
