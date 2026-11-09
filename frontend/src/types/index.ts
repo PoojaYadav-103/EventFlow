@@ -125,5 +125,6 @@ export interface MockReceiverConfig {
   status_code: number;
   delay_seconds: number;
   reject_all: boolean;
+  signing_secret?: string | null;
 }
 

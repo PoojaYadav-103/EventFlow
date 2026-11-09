@@ -14,29 +14,54 @@ export const MockReceiverPage: React.FC = () => {
   const [copiedDocker, setCopiedDocker] = useState(false);
   const [copiedLocal, setCopiedLocal] = useState(false);
   const [savingConfig, setSavingConfig] = useState(false);
+  const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null);
 
   const dockerWebhookUrl = 'http://backend:8000/api/v1/mock-receiver/webhook';
   const localhostWebhookUrl = 'http://localhost:8000/api/v1/mock-receiver/webhook';
 
-  const fetchData = async () => {
-    try {
-      const [fetchedLogs, fetchedConfig] = await Promise.all([
-        api.getMockLogs(),
-        api.getMockConfig(),
-      ]);
-      setLogs(fetchedLogs);
-      setConfig(fetchedConfig);
-    } catch (err) {
-      console.error('Failed to load mock receiver data', err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 3000);
-    return () => clearInterval(interval);
+    let isMounted = true;
+
+    const fetchInitialData = async () => {
+      try {
+        const [fetchedLogs, fetchedConfig] = await Promise.all([
+          api.getMockLogs(),
+          api.getMockConfig(),
+        ]);
+        if (isMounted) {
+          setLogs(fetchedLogs);
+          setConfig(fetchedConfig);
+        }
+      } catch (err) {
+        console.error('Failed to load initial mock receiver data', err);
+      } finally {
+        if (isMounted) {
+          setLoading(false);
+        }
+      }
+    };
+
+    fetchInitialData();
+
+    // Periodic polling: ONLY poll incoming webhook logs.
+    // NEVER poll mock config here to guarantee log polling cannot overwrite
+    // or stomp on the user's configuration form inputs.
+    const pollLogs = async () => {
+      try {
+        const fetchedLogs = await api.getMockLogs();
+        if (isMounted) {
+          setLogs(fetchedLogs);
+        }
+      } catch (err) {
+        console.error('Failed to poll mock receiver logs', err);
+      }
+    };
+
+    const interval = setInterval(pollLogs, 3000);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
   }, []);
 
   const handleCopyDocker = () => {
@@ -54,9 +79,17 @@ export const MockReceiverPage: React.FC = () => {
   const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault();
     setSavingConfig(true);
+    setFeedbackMessage(null);
     try {
-      await api.updateMockConfig(config);
-      alert('Mock receiver response behavior updated.');
+      const payload: MockReceiverConfig = {
+        status_code: Number(config.status_code),
+        delay_seconds: Number(config.delay_seconds),
+        reject_all: Boolean(config.reject_all),
+      };
+      const updated = await api.updateMockConfig(payload);
+      setConfig(updated);
+      setFeedbackMessage(`Mock receiver updated: Returning HTTP ${updated.status_code}`);
+      setTimeout(() => setFeedbackMessage(null), 4000);
     } catch (err: any) {
       alert(`Failed to update config: ${err.message}`);
     } finally {
@@ -191,6 +224,12 @@ export const MockReceiverPage: React.FC = () => {
             </button>
           </div>
         </form>
+        {feedbackMessage && (
+          <div className="flex items-center gap-2 p-2.5 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-emerald-300 text-xs font-medium animate-fadeIn">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span>{feedbackMessage}</span>
+          </div>
+        )}
       </div>
 
       {/* Received Webhook Stream */}

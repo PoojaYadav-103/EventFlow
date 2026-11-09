@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.database.session import SessionLocal
 from app.models.delivery import Delivery
-from app.core.security import verify_signature
+from app.core.security import verify_signature, mask_secret
 from app.schemas.mock_receiver import MockWebhookLog, MockReceiverConfig
 
 router = APIRouter(prefix="/mock-receiver", tags=["Mock Webhook Receiver"])
@@ -52,21 +52,25 @@ async def receive_webhook(request: Request):
     delivery_id = headers.get("x-eventflow-delivery-id")
     event_type = headers.get("x-eventflow-event-type")
 
-    # Resolve signing secret:
-    # 1. Explicit query parameter ?secret=...
-    # 2. Explicit header X-Signing-Secret
-    # 3. Configured secret in mock receiver
-    # 4. Lookup from database using delivery_id or event_id
+    # Resolve signing secret according to strict precedence:
+    # 1. Explicit per-request override (?secret=... query param or X-Signing-Secret header)
+    # 2. Database lookup: When a delivery ID identifies an existing delivery, its endpoint's
+    #    database secret MUST be authoritative. Do not silently fall back to a global mock secret
+    #    if the delivery or endpoint secret is missing.
+    # 3. Fallback: Only if delivery is unknown in DB (e.g. standalone test mocks without DB fixtures),
+    #    fall back to configured global mock secret (_mock_config["signing_secret"]).
     secret: Optional[str] = (
         request.query_params.get("secret")
         or headers.get("x-signing-secret")
-        or _mock_config.get("signing_secret")
     )
+
+    is_delivery_known = False
 
     if not secret and (delivery_id or event_id):
         try:
             db = SessionLocal()
             try:
+                delivery = None
                 if delivery_id:
                     delivery = (
                         db.query(Delivery)
@@ -74,21 +78,29 @@ async def receive_webhook(request: Request):
                         .filter(Delivery.id == delivery_id)
                         .first()
                     )
-                    if delivery and delivery.endpoint:
-                        secret = delivery.endpoint.secret
-                if not secret and event_id:
+                if not delivery and event_id:
                     delivery = (
                         db.query(Delivery)
                         .options(joinedload(Delivery.endpoint))
                         .filter(Delivery.event_id == event_id)
                         .first()
                     )
-                    if delivery and delivery.endpoint:
+                if delivery:
+                    is_delivery_known = True
+                    if delivery.endpoint and delivery.endpoint.secret:
                         secret = delivery.endpoint.secret
+                    else:
+                        # Delivery exists in DB, but has no endpoint or secret.
+                        # As required: do not silently fall back to global mock secret.
+                        secret = None
             finally:
                 db.close()
         except Exception:
             pass
+
+    # Fallback to configured global secret ONLY when delivery is not a known DB delivery
+    if not secret and not is_delivery_known:
+        secret = _mock_config.get("signing_secret")
 
     # Perform authentic cryptographic HMAC-SHA256 signature verification
     is_valid_sig: bool = False
@@ -142,16 +154,27 @@ def configure_mock_receiver(config: MockReceiverConfig):
     _mock_config["status_code"] = config.status_code
     _mock_config["delay_seconds"] = config.delay_seconds
     _mock_config["reject_all"] = config.reject_all
-    if config.signing_secret is not None:
-        _mock_config["signing_secret"] = config.signing_secret
-    return config
+
+    # Explicit secret clearing or setting
+    if "signing_secret" in config.model_fields_set:
+        val = config.signing_secret
+        if not val or not val.strip():
+            _mock_config["signing_secret"] = None
+        elif "••••" not in val:
+            # Only set raw secret if it's not a masked string from GET response
+            _mock_config["signing_secret"] = val
+
+    # Return the actual current configuration with masked secret (GET/POST consistency)
+    return get_mock_config()
 
 
 @router.get("/config", response_model=MockReceiverConfig, summary="Get mock receiver configuration")
 def get_mock_config():
+    sec = _mock_config.get("signing_secret")
+    masked_sec = mask_secret(sec) if sec else None
     return MockReceiverConfig(
         status_code=_mock_config.get("status_code", 200),
         delay_seconds=_mock_config.get("delay_seconds", 0.0),
         reject_all=_mock_config.get("reject_all", False),
-        signing_secret=_mock_config.get("signing_secret"),
+        signing_secret=masked_sec,
     )
