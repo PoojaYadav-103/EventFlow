@@ -157,7 +157,7 @@ def _run_with_overall_deadline(coro_fn, *args, **kwargs):
 
 async def _async_http_post(
     url: str,
-    payload_str: str,
+    payload_bytes: bytes,
     headers: Dict[str, str],
     timeout_seconds: float,
 ) -> Tuple[int, str, Dict[str, str], str]:
@@ -165,6 +165,7 @@ async def _async_http_post(
     Executes async HTTP POST under an explicit, cancellable asyncio wall-clock deadline.
     Guarantees immediate task cancellation and TCP socket teardown if the total
     wall-clock duration exceeds timeout_seconds (e.g. slowloris / slow-trickle stream).
+    Sends exact raw payload_bytes over the wire.
     """
     socket_timeout = httpx.Timeout(
         timeout=timeout_seconds,
@@ -177,7 +178,7 @@ async def _async_http_post(
         async with httpx.AsyncClient(timeout=socket_timeout, follow_redirects=False) as client:
             resp = await client.post(
                 url,
-                content=payload_str,
+                content=payload_bytes,
                 headers=headers,
             )
             body_preview = resp.text[:4096] if resp.text else ""
@@ -219,9 +220,9 @@ def execute_webhook_request(
             outcome=HTTPOutcome.PERMANENT_FAILURE,
         )
 
-    # 2. Serialize payload & sign
-    payload_str = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    sig_header, timestamp = sign_payload(secret, payload_str)
+    # 2. Serialize payload & sign exact raw bytes (single payload_bytes buffer)
+    payload_bytes = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    sig_header, timestamp = sign_payload(secret, payload_bytes)
 
     headers = {
         "Content-Type": "application/json",
@@ -238,7 +239,7 @@ def execute_webhook_request(
         status_code, reason_phrase, resp_headers, resp_body_preview = _run_with_overall_deadline(
             _async_http_post,
             validated_url,
-            payload_str,
+            payload_bytes,
             headers,
             effective_timeout,
         )

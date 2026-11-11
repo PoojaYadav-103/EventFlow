@@ -1,4 +1,5 @@
-from typing import List, Optional
+from typing import List, Optional, Any
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -45,6 +46,24 @@ class Settings(BaseSettings):
     
     # Secret Encryption at Rest (Module 3 Security)
     ENCRYPTION_KEY: Optional[str] = None
+
+    # Webhook Signatures & Replay Protection (Module 3.2)
+    SIGNATURE_TOLERANCE_SECONDS: int = 300
+    SIGNATURE_FUTURE_TOLERANCE_SECONDS: int = 60
+
+    @field_validator("SIGNATURE_TOLERANCE_SECONDS", mode="before")
+    @classmethod
+    def validate_signature_tolerance(cls, v: Any) -> int:
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise ValueError("SIGNATURE_TOLERANCE_SECONDS must be a positive integer > 0.")
+        return v
+
+    @field_validator("SIGNATURE_FUTURE_TOLERANCE_SECONDS", mode="before")
+    @classmethod
+    def validate_signature_future_tolerance(cls, v: Any) -> int:
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError("SIGNATURE_FUTURE_TOLERANCE_SECONDS must be a non-negative integer >= 0.")
+        return v
 
     # CORS
     CORS_ORIGINS: List[str] = [
