@@ -436,7 +436,7 @@ def test_webhook_client_handles_invalid_url_without_crashing():
     assert res1.outcome == HTTPOutcome.PERMANENT_FAILURE
 
     # Defensive handling if transport raises httpx.InvalidURL directly
-    with patch("app.services.webhook_client.validate_webhook_url", return_value="https://93.184.216.34/hook"):
+    with patch("app.services.webhook_client.prevalidate_webhook_url_static", return_value="https://93.184.216.34/hook"):
         with patch("app.services.webhook_client._run_with_overall_deadline", side_effect=httpx.InvalidURL("bad url")):
             res2 = execute_webhook_request(
                 url="https://93.184.216.34/hook",

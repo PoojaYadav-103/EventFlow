@@ -3,14 +3,23 @@ import concurrent.futures
 import enum
 import email.utils
 import json
+import ssl
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 import httpx
 
 from app.core.config import settings
+from app.core.pinned_transport import PinnedAsyncHTTPTransport, resolve_verified_ssl_context
 from app.core.security import sign_payload
-from app.core.ssrf import validate_webhook_url, SSRFProtectionError
+from app.core.ssrf import (
+    DNSResolutionTimeoutError,
+    PermanentDNSResolutionError,
+    SSRFProtectionError,
+    TransientDNSResolutionError,
+    async_resolve_and_pin_target,
+    prevalidate_webhook_url_static,
+)
 
 
 class HTTPOutcome(str, enum.Enum):
@@ -155,33 +164,66 @@ def _run_with_overall_deadline(coro_fn, *args, **kwargs):
         return asyncio.run(coro_fn(*args, **kwargs))
 
 
+def _is_tls_certificate_error(exc: BaseException) -> bool:
+    """Walk exception causes to identify TLS certificate or hostname verification failures."""
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ssl.SSLCertVerificationError):
+            return True
+        if isinstance(cur, ssl.SSLError):
+            msg = str(cur).lower()
+            if "certificate verify failed" in msg or "hostname mismatch" in msg:
+                return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 async def _async_http_post(
     url: str,
     payload_bytes: bytes,
     headers: Dict[str, str],
     timeout_seconds: float,
+    allow_internal: Optional[bool] = None,
+    ssl_context: Optional[ssl.SSLContext] = None,
 ) -> Tuple[int, str, Dict[str, str], str]:
     """
     Executes async HTTP POST under an explicit, cancellable asyncio wall-clock deadline.
-    Guarantees immediate task cancellation and TCP socket teardown if the total
-    wall-clock duration exceeds timeout_seconds (e.g. slowloris / slow-trickle stream).
-    Sends exact raw payload_bytes over the wire.
+    Resolves DNS and pins the validated IP immediately before TCP connection establishment
+    using an isolated per-delivery PinnedAsyncHTTPTransport with pooling disabled.
     """
-    socket_timeout = httpx.Timeout(
-        timeout=timeout_seconds,
-        connect=min(5.0, timeout_seconds),
-        read=timeout_seconds,
-        write=timeout_seconds,
-        pool=timeout_seconds,
-    )
+    verified_ssl_ctx = resolve_verified_ssl_context(ssl_context)
+    deadline_start = time.monotonic()
+
     async with asyncio.timeout(timeout_seconds):
+        dns_budget = min(5.0, float(timeout_seconds))
+        pinned_target = await async_resolve_and_pin_target(
+            url,
+            allow_internal=allow_internal,
+            dns_timeout=dns_budget,
+        )
+
+        remaining_budget = max(0.05, float(timeout_seconds) - (time.monotonic() - deadline_start))
+        socket_timeout = httpx.Timeout(
+            timeout=remaining_budget,
+            connect=min(5.0, remaining_budget),
+            read=remaining_budget,
+            write=remaining_budget,
+            pool=remaining_budget,
+        )
+        transport = PinnedAsyncHTTPTransport(
+            pinned_target,
+            ssl_context=verified_ssl_ctx,
+        )
         async with httpx.AsyncClient(
+            transport=transport,
             timeout=socket_timeout,
             follow_redirects=False,
             trust_env=False,
         ) as client:
             resp = await client.post(
-                url,
+                pinned_target.normalized_url,
                 content=payload_bytes,
                 headers=headers,
             )
@@ -198,22 +240,27 @@ def execute_webhook_request(
     payload: Dict[str, Any],
     timeout_seconds: float = None,
     allow_internal: bool = None,
+    ssl_context: Optional[ssl.SSLContext] = None,
 ) -> WebhookExecutionResult:
     """
     Executes a webhook HTTP POST request with HMAC-SHA256 signing,
-    SSRF validation, genuine cancellable overall HTTP deadline, Retry-After extraction,
-    and outcome classification.
+    SSRF validation + DNS IP pinning, genuine cancellable overall HTTP deadline,
+    Retry-After extraction, and outcome classification.
     """
     if timeout_seconds is None:
         timeout_seconds = settings.WEBHOOK_TIMEOUT
+
+    # Enforce strict TLS verification if a custom CA context is supplied (e.g. tests)
+    if ssl_context is not None:
+        resolve_verified_ssl_context(ssl_context)
 
     # Enforce overall wall-clock deadline strictly shorter than the delivery lease duration
     max_safe_deadline = max(1.0, settings.LEASE_DURATION_SECONDS - 5.0)
     effective_timeout = min(float(timeout_seconds), max_safe_deadline)
 
-    # 1. SSRF validation check
+    # 1. Static SSRF pre-validation and URL normalization (no blocking DNS outside deadline)
     try:
-        validated_url = validate_webhook_url(url, allow_internal=allow_internal)
+        validated_url = prevalidate_webhook_url_static(url, allow_internal=allow_internal)
     except (SSRFProtectionError, ValueError) as e:
         return WebhookExecutionResult(
             success=False,
@@ -246,6 +293,8 @@ def execute_webhook_request(
             payload_bytes,
             headers,
             effective_timeout,
+            allow_internal=allow_internal,
+            ssl_context=ssl_context,
         )
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
 
@@ -274,14 +323,49 @@ def execute_webhook_request(
             retry_after_seconds=retry_after_sec,
         )
 
-    except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException):
+    except PermanentDNSResolutionError as e:
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
         return WebhookExecutionResult(
             success=False,
             http_status=None,
             response_time_ms=elapsed_ms,
             request_headers=headers,
-            error_message=f"Request timed out after {effective_timeout}s total deadline",
+            error_message=f"SSRF/DNS permanent resolution failure: {str(e)}",
+            outcome=HTTPOutcome.PERMANENT_FAILURE,
+        )
+    except SSRFProtectionError as e:
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        return WebhookExecutionResult(
+            success=False,
+            http_status=None,
+            response_time_ms=elapsed_ms,
+            request_headers=headers,
+            error_message=f"SSRF Protection blocked request: {str(e)}",
+            outcome=HTTPOutcome.PERMANENT_FAILURE,
+        )
+    except TransientDNSResolutionError as e:
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        return WebhookExecutionResult(
+            success=False,
+            http_status=None,
+            response_time_ms=elapsed_ms,
+            request_headers=headers,
+            error_message=f"Temporary DNS resolution failure: {str(e)}",
+            outcome=HTTPOutcome.RETRYABLE_FAILURE,
+        )
+    except (DNSResolutionTimeoutError, TimeoutError, asyncio.TimeoutError, httpx.TimeoutException) as e:
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        msg = (
+            f"DNS resolution timed out after {effective_timeout}s total deadline: {str(e)}"
+            if isinstance(e, DNSResolutionTimeoutError)
+            else f"Request timed out after {effective_timeout}s total deadline"
+        )
+        return WebhookExecutionResult(
+            success=False,
+            http_status=None,
+            response_time_ms=elapsed_ms,
+            request_headers=headers,
+            error_message=msg,
             outcome=HTTPOutcome.RETRYABLE_FAILURE,
         )
     except httpx.InvalidURL as e:
@@ -296,6 +380,15 @@ def execute_webhook_request(
         )
     except httpx.ConnectError as e:
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        if _is_tls_certificate_error(e):
+            return WebhookExecutionResult(
+                success=False,
+                http_status=None,
+                response_time_ms=elapsed_ms,
+                request_headers=headers,
+                error_message=f"TLS certificate verification failed: {str(e)}",
+                outcome=HTTPOutcome.PERMANENT_FAILURE,
+            )
         return WebhookExecutionResult(
             success=False,
             http_status=None,

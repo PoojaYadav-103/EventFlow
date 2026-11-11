@@ -1,7 +1,13 @@
+import asyncio
+from dataclasses import dataclass
+import errno
 import ipaddress
+import queue
 import re
 import socket
-from typing import Iterator, Optional, Union
+import threading
+import time
+from typing import Any, Callable, Iterator, Optional, Sequence, Tuple, Union
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -12,6 +18,9 @@ from app.core.config import settings
 MAX_URL_LENGTH = 2048
 MAX_HOSTNAME_LENGTH = 253
 MAX_LABEL_LENGTH = 63
+MAX_CONCURRENT_DNS_LOOKUPS = 16
+MAX_PINNED_CONNECT_IPS = 8
+DEFAULT_DNS_TIMEOUT_SECONDS = 5.0
 
 ASCII_DIGITS = frozenset("0123456789")
 HEX_CHARS = frozenset("0123456789abcdefABCDEF")
@@ -116,6 +125,171 @@ NON_PUBLIC_NETWORKS = (
 class SSRFProtectionError(ValueError):
     """Raised when a URL violates SSRF safety constraints."""
     pass
+
+
+class PermanentDNSResolutionError(SSRFProtectionError):
+    """Raised when hostname resolution fails permanently (e.g., NXDOMAIN/NODATA)."""
+    pass
+
+
+class TransientDNSResolutionError(OSError):
+    """Raised when hostname resolution fails due to a transient resolver error (e.g., EAI_AGAIN)."""
+    pass
+
+
+class DNSResolutionTimeoutError(TimeoutError):
+    """Raised when DNS resolution exceeds its configured timeout or bounded concurrency budget."""
+    pass
+
+
+@dataclass(frozen=True)
+class _PrevalidatedURL:
+    normalized_url: str
+    scheme: str
+    host: str
+    port: int
+    literal_ip: Optional[IPAddress]
+    allow_internal: bool
+
+
+@dataclass(frozen=True)
+class PinnedTarget:
+    """Immutable snapshot of a validated destination URL and its pinned canonical IP list."""
+    normalized_url: str
+    scheme: str
+    host: str
+    port: int
+    pinned_ips: Tuple[str, ...]
+    is_ip_literal: bool
+    allow_internal: bool
+
+
+_TRANSIENT_EAI_ERRNOS = frozenset(
+    errno
+    for name in ("EAI_AGAIN", "EAI_SYSTEM", "EAI_MEMORY")
+    if (errno := getattr(socket, name, None)) is not None
+)
+
+
+def _deliver_dns_future(
+    fut: asyncio.Future,
+    result: Any,
+    exc: Optional[BaseException],
+) -> None:
+    if fut.done():
+        return
+    if exc is not None:
+        fut.set_exception(exc)
+    else:
+        fut.set_result(result)
+
+
+class BoundedDNSResolver:
+    """
+    Bounded daemon-thread DNS executor.
+
+    Using a bounded daemon pool instead of loop's default executor guarantees:
+    1. Cancelling a timed-out asyncio task never causes asyncio.run() to block
+       up to THREAD_JOIN_TIMEOUT (300s) joining a stuck C getaddrinfo() call.
+    2. Stuck OS resolver calls cannot accumulate unbounded threads because active
+       concurrency is capped strictly at `max_workers`.
+    """
+
+    def __init__(self, max_workers: int = MAX_CONCURRENT_DNS_LOOKUPS) -> None:
+        if max_workers <= 0:
+            raise ValueError("max_workers must be positive")
+        self._max_workers = max_workers
+        self._semaphore = threading.BoundedSemaphore(max_workers)
+        self._queue: queue.SimpleQueue[
+            tuple[asyncio.AbstractEventLoop, asyncio.Future, Callable[..., Any], str, int]
+        ] = queue.SimpleQueue()
+        self._worker_lock = threading.Lock()
+        self._spawned_workers = 0
+        self._active_or_queued = 0
+
+    def _worker_loop(self) -> None:
+        while True:
+            loop, fut, resolver_fn, host, port = self._queue.get()
+            result: Any = None
+            exc: Optional[BaseException] = None
+            try:
+                result = resolver_fn(host, port)
+            except BaseException as err:
+                exc = err
+            finally:
+                with self._worker_lock:
+                    self._active_or_queued -= 1
+                self._semaphore.release()
+
+            try:
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(_deliver_dns_future, fut, result, exc)
+            except RuntimeError:
+                pass
+
+    def _ensure_worker_available(self) -> None:
+        with self._worker_lock:
+            self._active_or_queued += 1
+            if self._active_or_queued > self._spawned_workers and self._spawned_workers < self._max_workers:
+                self._spawned_workers += 1
+                thread = threading.Thread(
+                    target=self._worker_loop,
+                    name=f"eventflow-dns-{self._spawned_workers}",
+                    daemon=True,
+                )
+                thread.start()
+
+    async def resolve(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout: Optional[float] = None,
+        resolver_fn: Optional[Callable[..., Any]] = None,
+    ) -> Any:
+        effective_timeout = DEFAULT_DNS_TIMEOUT_SECONDS if timeout is None else float(timeout)
+        if effective_timeout <= 0:
+            raise DNSResolutionTimeoutError(f"DNS resolution timed out for '{host}'.")
+
+        deadline = time.monotonic() + effective_timeout
+        acquired = self._semaphore.acquire(blocking=False)
+        while not acquired:
+            remaining_wait = deadline - time.monotonic()
+            if remaining_wait <= 0:
+                raise DNSResolutionTimeoutError(
+                    f"DNS concurrency limit ({self._max_workers}) reached; timed out waiting for resolver slot for '{host}'."
+                )
+            await asyncio.sleep(min(0.01, remaining_wait))
+            acquired = self._semaphore.acquire(blocking=False)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._semaphore.release()
+            raise DNSResolutionTimeoutError(
+                f"DNS resolution timed out after {effective_timeout:.2f}s for '{host}'."
+            )
+
+        fn = socket.getaddrinfo if resolver_fn is None else resolver_fn
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        try:
+            self._ensure_worker_available()
+            self._queue.put((loop, fut, fn, host, port))
+        except BaseException:
+            with self._worker_lock:
+                self._active_or_queued = max(0, self._active_or_queued - 1)
+            self._semaphore.release()
+            raise
+
+        try:
+            return await asyncio.wait_for(fut, timeout=remaining)
+        except TimeoutError as exc:
+            raise DNSResolutionTimeoutError(
+                f"DNS resolution timed out after {effective_timeout:.2f}s for '{host}'."
+            ) from exc
+
+
+_dns_resolver = BoundedDNSResolver(max_workers=MAX_CONCURRENT_DNS_LOOKUPS)
 
 
 def _extract_embedded_ips(ip_obj: IPAddress) -> Iterator[IPAddress]:
@@ -388,10 +562,108 @@ def _normalize_host_and_ip(raw_host: str, is_bracketed_ipv6: bool) -> tuple[str,
     return ascii_host, None
 
 
-def validate_webhook_url(url: str, allow_internal: Optional[bool] = None) -> str:
+_TRANSIENT_OS_ERRNOS = frozenset(
+    err
+    for name in ("EAGAIN", "EWOULDBLOCK", "ETIMEDOUT", "ENETUNREACH", "EHOSTUNREACH")
+    if (err := getattr(errno, name, None)) is not None
+)
+
+
+def _canonicalize_allowed_ip(ip_str: str) -> str:
+    ip_obj = ipaddress.ip_address(ip_str)
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        return ip_obj.ipv4_mapped.compressed
+    return ip_obj.compressed
+
+
+def _order_pinned_ips(unique_ips: Sequence[str]) -> Tuple[str, ...]:
     """
-    Validate that a webhook target URL is well-formed, normalized, and safe from SSRF.
-    Returns the normalized URL or raises SSRFProtectionError.
+    Preserve resolution preference while prioritizing fast dual-stack fallback:
+    place the first address of the alternate IP family second if present, then
+    truncate dialed candidates to MAX_PINNED_CONNECT_IPS.
+    """
+    if len(unique_ips) <= 1:
+        return tuple(unique_ips)
+
+    first_ip = unique_ips[0]
+    first_version = ipaddress.ip_address(first_ip).version
+    other_idx: Optional[int] = None
+    for idx in range(1, len(unique_ips)):
+        if ipaddress.ip_address(unique_ips[idx]).version != first_version:
+            other_idx = idx
+            break
+
+    if other_idx is None or other_idx == 1:
+        return tuple(unique_ips[:MAX_PINNED_CONNECT_IPS])
+
+    reordered = [first_ip, unique_ips[other_idx]]
+    reordered.extend(unique_ips[idx] for idx in range(1, len(unique_ips)) if idx != other_idx)
+    return tuple(reordered[:MAX_PINNED_CONNECT_IPS])
+
+
+def _validate_and_order_addrinfo(
+    host: str,
+    addr_info: Any,
+    allow_internal: bool,
+) -> Tuple[str, ...]:
+    """
+    Validate every IP returned by DNS against SSRF policy before returning any IP.
+    Raises SSRFProtectionError on any disallowed/mixed IP and PermanentDNSResolutionError
+    if no usable stream addresses remain.
+    """
+    if not addr_info:
+        raise PermanentDNSResolutionError(f"Could not resolve hostname '{host}'.")
+
+    validated_stream_ips: list[str] = []
+    seen: set[str] = set()
+    all_raw_ips: list[str] = []
+
+    for info in addr_info:
+        if not info or len(info) < 5 or not info[4]:
+            continue
+        raw_ip = info[4][0]
+        all_raw_ips.append(raw_ip)
+        if not is_ip_allowed(raw_ip, allow_internal=allow_internal):
+            raise SSRFProtectionError(
+                f"Destination resolves to forbidden private/internal IP address '{raw_ip}'."
+            )
+
+        socktype = info[1] if len(info) > 1 else 0
+        if socktype in (0, socket.SOCK_STREAM):
+            canon = _canonicalize_allowed_ip(raw_ip)
+            if canon not in seen:
+                seen.add(canon)
+                validated_stream_ips.append(canon)
+
+    if not all_raw_ips or not validated_stream_ips:
+        raise PermanentDNSResolutionError(f"Could not resolve hostname '{host}'.")
+
+    return _order_pinned_ips(validated_stream_ips)
+
+
+def _classify_dns_oserror(host: str, exc: OSError) -> Exception:
+    """Distinguish transient resolver failures from permanent NXDOMAIN/name errors."""
+    if isinstance(exc, TimeoutError):
+        return DNSResolutionTimeoutError(f"DNS resolution timed out for '{host}'.")
+
+    err_no = getattr(exc, "errno", None)
+    if isinstance(exc, socket.gaierror):
+        if err_no is not None and err_no in _TRANSIENT_EAI_ERRNOS:
+            return TransientDNSResolutionError(
+                f"Transient DNS resolution failure for '{host}': {exc}"
+            )
+        return PermanentDNSResolutionError(f"Could not resolve hostname '{host}'.")
+
+    if err_no is not None and err_no in _TRANSIENT_OS_ERRNOS:
+        return TransientDNSResolutionError(
+            f"Transient DNS resolution failure for '{host}': {exc}"
+        )
+    return PermanentDNSResolutionError(f"Could not resolve hostname '{host}'.")
+
+
+def _prevalidate_url(url: str, allow_internal: Optional[bool] = None) -> _PrevalidatedURL:
+    """
+    Normalize URL and enforce static SSRF constraints without performing DNS lookups.
     """
     if allow_internal is None:
         allow_internal = settings.ALLOW_INTERNAL_NETWORKS
@@ -484,35 +756,101 @@ def validate_webhook_url(url: str, allow_internal: Optional[bool] = None) -> str
             f"Destination specifies forbidden cloud metadata IP address '{literal_ip}'."
         )
 
-    if allow_internal:
-        return normalized_url
+    if not allow_internal:
+        if _is_internal_forbidden_hostname(normalized_host):
+            raise SSRFProtectionError(
+                f"Forbidden host '{normalized_host}'. Localhost and internal hostnames are not permitted."
+            )
 
-    if _is_internal_forbidden_hostname(normalized_host):
-        raise SSRFProtectionError(
-            f"Forbidden host '{normalized_host}'. Localhost and internal hostnames are not permitted."
-        )
-
-    if literal_ip is not None:
-        if not is_ip_allowed(literal_ip.compressed, allow_internal=False):
+        if literal_ip is not None and not is_ip_allowed(literal_ip.compressed, allow_internal=False):
             raise SSRFProtectionError(
                 f"Destination specifies forbidden private/internal IP address '{literal_ip.compressed}'."
             )
-        return normalized_url
 
     effective_port = normalized_port if normalized_port is not None else default_port
+    return _PrevalidatedURL(
+        normalized_url=normalized_url,
+        scheme=scheme,
+        host=normalized_host,
+        port=effective_port,
+        literal_ip=literal_ip,
+        allow_internal=allow_internal,
+    )
+
+
+def prevalidate_webhook_url_static(url: str, allow_internal: Optional[bool] = None) -> str:
+    """Validate URL syntax, normalization, and static SSRF rules without invoking DNS."""
+    return _prevalidate_url(url, allow_internal=allow_internal).normalized_url
+
+
+def validate_webhook_url(url: str, allow_internal: Optional[bool] = None) -> str:
+    """
+    Validate that a webhook target URL is well-formed, normalized, and safe from SSRF.
+    Used for endpoint registration/update. Skips DNS when allow_internal=True so Docker/dev
+    hostnames (e.g. backend:8000) can be registered offline, and validates DNS when False.
+    """
+    pre = _prevalidate_url(url, allow_internal=allow_internal)
+    if pre.allow_internal or pre.literal_ip is not None:
+        return pre.normalized_url
+
     try:
-        addr_info = socket.getaddrinfo(normalized_host, effective_port)
-        resolved_ips = {info[4][0] for info in addr_info if info and len(info) > 4 and info[4]}
-    except OSError:
-        raise SSRFProtectionError(f"Could not resolve hostname '{normalized_host}'.")
+        addr_info = socket.getaddrinfo(pre.host, pre.port)
+    except OSError as exc:
+        raise SSRFProtectionError(f"Could not resolve hostname '{pre.host}'.") from exc
 
-    if not resolved_ips:
-        raise SSRFProtectionError(f"Could not resolve hostname '{normalized_host}'.")
+    _validate_and_order_addrinfo(pre.host, addr_info, allow_internal=False)
+    return pre.normalized_url
 
-    for resolved_ip in resolved_ips:
-        if not is_ip_allowed(resolved_ip, allow_internal=False):
+
+async def async_resolve_and_pin_target(
+    url: str,
+    allow_internal: Optional[bool] = None,
+    dns_timeout: Optional[float] = None,
+) -> PinnedTarget:
+    """
+    Perform a single bounded async DNS lookup and SSRF validation pass immediately before
+    connection establishment, returning an immutable PinnedTarget whose validated IP list
+    must be dialed directly without a second DNS resolution.
+    """
+    pre = _prevalidate_url(url, allow_internal=allow_internal)
+
+    if pre.literal_ip is not None:
+        if not is_ip_allowed(pre.literal_ip.compressed, allow_internal=pre.allow_internal):
             raise SSRFProtectionError(
-                f"Destination resolves to forbidden private/internal IP address '{resolved_ip}'."
+                f"Destination specifies forbidden IP address '{pre.literal_ip.compressed}'."
             )
+        canon_ip = _canonicalize_allowed_ip(pre.literal_ip.compressed)
+        return PinnedTarget(
+            normalized_url=pre.normalized_url,
+            scheme=pre.scheme,
+            host=pre.host,
+            port=pre.port,
+            pinned_ips=(canon_ip,),
+            is_ip_literal=True,
+            allow_internal=pre.allow_internal,
+        )
 
-    return normalized_url
+    try:
+        addr_info = await _dns_resolver.resolve(
+            pre.host,
+            pre.port,
+            timeout=dns_timeout,
+            resolver_fn=socket.getaddrinfo,
+        )
+    except DNSResolutionTimeoutError:
+        raise
+    except TimeoutError as exc:
+        raise DNSResolutionTimeoutError(f"DNS resolution timed out for '{pre.host}'.") from exc
+    except OSError as exc:
+        raise _classify_dns_oserror(pre.host, exc) from exc
+
+    pinned_ips = _validate_and_order_addrinfo(pre.host, addr_info, allow_internal=pre.allow_internal)
+    return PinnedTarget(
+        normalized_url=pre.normalized_url,
+        scheme=pre.scheme,
+        host=pre.host,
+        port=pre.port,
+        pinned_ips=pinned_ips,
+        is_ip_literal=False,
+        allow_internal=pre.allow_internal,
+    )
