@@ -141,6 +141,11 @@ def update_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"SSRF Protection Error: {str(e)}"
         )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(e)
+        )
 
 
 @router.post(

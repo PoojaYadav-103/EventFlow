@@ -17,12 +17,12 @@ class EndpointService:
         Validates URL (including SSRF checks) and generates a cryptographic signing secret.
         Returns (endpoint, unmasked_secret).
         """
-        # Validate SSRF
-        validate_webhook_url(data.url)
+        # Validate SSRF and persist canonical normalized URL
+        normalized_url = validate_webhook_url(data.url)
 
         secret = generate_signing_secret()
         endpoint = Endpoint(
-            url=data.url,
+            url=normalized_url,
             description=data.description,
             secret=secret,
             is_active=True,
@@ -79,8 +79,8 @@ class EndpointService:
             return None
 
         if data.url is not None:
-            validate_webhook_url(data.url)
-            endpoint.url = data.url
+            normalized_url = validate_webhook_url(data.url)
+            endpoint.url = normalized_url
         if data.description is not None:
             endpoint.description = data.description
         if data.is_active is not None:

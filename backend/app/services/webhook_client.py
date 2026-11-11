@@ -175,7 +175,11 @@ async def _async_http_post(
         pool=timeout_seconds,
     )
     async with asyncio.timeout(timeout_seconds):
-        async with httpx.AsyncClient(timeout=socket_timeout, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=socket_timeout,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
             resp = await client.post(
                 url,
                 content=payload_bytes,
@@ -210,7 +214,7 @@ def execute_webhook_request(
     # 1. SSRF validation check
     try:
         validated_url = validate_webhook_url(url, allow_internal=allow_internal)
-    except SSRFProtectionError as e:
+    except (SSRFProtectionError, ValueError) as e:
         return WebhookExecutionResult(
             success=False,
             http_status=None,
@@ -279,6 +283,16 @@ def execute_webhook_request(
             request_headers=headers,
             error_message=f"Request timed out after {effective_timeout}s total deadline",
             outcome=HTTPOutcome.RETRYABLE_FAILURE,
+        )
+    except httpx.InvalidURL as e:
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        return WebhookExecutionResult(
+            success=False,
+            http_status=None,
+            response_time_ms=elapsed_ms,
+            request_headers=headers,
+            error_message=f"Invalid destination URL: {str(e)}",
+            outcome=HTTPOutcome.PERMANENT_FAILURE,
         )
     except httpx.ConnectError as e:
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)

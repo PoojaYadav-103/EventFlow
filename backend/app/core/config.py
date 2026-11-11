@@ -41,7 +41,7 @@ class Settings(BaseSettings):
         return self.WEBHOOK_TIMEOUT
     
     # Security & SSRF
-    ALLOW_INTERNAL_NETWORKS: bool = True  # Allows localhost/internal IPs in development
+    ALLOW_INTERNAL_NETWORKS: bool = False  # Fail-closed default; set true explicitly for local dev/Docker mock receivers
     SIGNING_SECRET_PREFIX: str = "whsec_"
     
     # Secret Encryption at Rest (Module 3 Security)
