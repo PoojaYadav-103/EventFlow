@@ -40,6 +40,7 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - ALLOW_INTERNAL_NETWORKS=true
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
     ports:
       - "8000:8000"
     depends_on:
@@ -62,6 +63,7 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - ALLOW_INTERNAL_NETWORKS=true
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,6 +82,7 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - ALLOW_INTERNAL_NETWORKS=true
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
     depends_on:
       postgres:
         condition: service_healthy

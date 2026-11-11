@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     ALLOW_INTERNAL_NETWORKS: bool = True  # Allows localhost/internal IPs in development
     SIGNING_SECRET_PREFIX: str = "whsec_"
     
+    # Secret Encryption at Rest (Module 3 Security)
+    ENCRYPTION_KEY: Optional[str] = None
+
     # CORS
     CORS_ORIGINS: List[str] = [
         "http://localhost:3000",

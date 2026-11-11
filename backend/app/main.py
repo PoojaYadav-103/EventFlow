@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.core.config import settings
+from app.core.encryption import validate_encryption_key
 from app.database.session import engine, Base
 import app.models  # Ensure all SQLAlchemy models are registered
 from app.api.v1 import api_router
@@ -12,6 +13,8 @@ from app.api.v1 import api_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Schema lifecycle is strictly governed by Alembic migrations
+    # Validate secret encryption at rest key on startup
+    validate_encryption_key()
     yield
 
 

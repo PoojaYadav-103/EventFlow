@@ -18,6 +18,10 @@ TEST_DATABASE_URL = f"sqlite:///{TEST_DB_FILE}"
 os.environ["CELERY_TASK_ALWAYS_EAGER"] = "True"
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 os.environ["ALLOW_INTERNAL_NETWORKS"] = "True"
+os.environ["ENCRYPTION_KEY"] = "yU8qY9hWcKjP3vF7rB2sT6xZ1aE4dG5hI7kL9mN2pQ4="
+
+from app.core.config import settings
+settings.ENCRYPTION_KEY = "yU8qY9hWcKjP3vF7rB2sT6xZ1aE4dG5hI7kL9mN2pQ4="
 
 import app.database.session as db_session_module
 from app.database.session import Base, get_db

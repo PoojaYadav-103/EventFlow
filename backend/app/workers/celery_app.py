@@ -1,5 +1,6 @@
-from celery import Celery
+from celery import Celery, signals, bootsteps
 from app.core.config import settings
+from app.core.encryption import validate_encryption_key
 
 celery_app = Celery(
     "eventflow",
@@ -18,6 +19,31 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
 )
+
+# Validate encryption key at Celery worker launch
+class ValidateEncryptionKeyBootStep(bootsteps.Step):
+    def __init__(self, parent, **kwargs):
+        validate_encryption_key()
+
+celery_app.steps["worker"].add(ValidateEncryptionKeyBootStep)
+
+
+@signals.worker_init.connect
+def validate_celery_worker_key(**kwargs):
+    """
+    Validates that a valid ENCRYPTION_KEY is available when Celery worker starts.
+    Fails fast if missing or invalid.
+    """
+    validate_encryption_key()
+
+
+@signals.beat_init.connect
+def validate_celery_beat_key(**kwargs):
+    """
+    Validates that a valid ENCRYPTION_KEY is available when Celery Beat starts.
+    Fails fast if missing or invalid.
+    """
+    validate_encryption_key()
 
 # Auto-discover tasks in app.workers.tasks
 celery_app.autodiscover_tasks(["app.workers"])
