@@ -15,7 +15,7 @@ from app.models.outbox import OutboxEvent, OutboxStatus
 from app.services.delivery_service import DeliveryService, DeliveryRetryError
 from app.services.webhook_client import WebhookExecutionResult, HTTPOutcome
 
-TEST_POSTGRES_URL = "postgresql+psycopg://postgres:postgres@localhost:5432/eventflow_test"
+TEST_POSTGRES_URL = "postgresql+psycopg://postgres:postgres@postgres:5432/eventflow_test"
 
 
 @pytest.fixture(scope="module")

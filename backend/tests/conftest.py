@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 TEST_DB_FILE = os.path.join(backend_dir, "test_eventflow.db")
 TEST_DATABASE_URL = f"sqlite:///{TEST_DB_FILE}"
@@ -24,19 +25,24 @@ from app.core.config import settings
 settings.ENCRYPTION_KEY = "yU8qY9hWcKjP3vF7rB2sT6xZ1aE4dG5hI7kL9mN2pQ4="
 
 import app.database.session as db_session_module
-from app.database.session import Base, get_db
-from app.main import app
-from app.workers.celery_app import celery_app
 
-# Point the global session and engine to our test database
+# Dispose the original engine created on import and point the global session
+# and engine to our test database before importing app modules.
+db_session_module.engine.dispose()
+
 test_engine = create_engine(
     TEST_DATABASE_URL,
     connect_args={"check_same_thread": False},
+    poolclass=NullPool,
 )
 TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
 
 db_session_module.engine = test_engine
 db_session_module.SessionLocal = TestSessionLocal
+
+from app.database.session import Base, get_db
+from app.main import app
+from app.workers.celery_app import celery_app
 
 # Configure Celery eager with in-memory broker
 celery_app.conf.update(
@@ -47,8 +53,18 @@ celery_app.conf.update(
 )
 
 
+def _remove_test_db_file():
+    if os.path.exists(TEST_DB_FILE):
+        try:
+            os.remove(TEST_DB_FILE)
+        except OSError:
+            pass
+
+
 @pytest.fixture(scope="function")
 def db_session():
+    test_engine.dispose()
+    _remove_test_db_file()
     Base.metadata.create_all(bind=test_engine)
     session = TestSessionLocal()
     try:
@@ -56,11 +72,8 @@ def db_session():
     finally:
         session.close()
         Base.metadata.drop_all(bind=test_engine)
-        if os.path.exists(TEST_DB_FILE):
-            try:
-                os.remove(TEST_DB_FILE)
-            except Exception:
-                pass
+        test_engine.dispose()
+        _remove_test_db_file()
 
 
 @pytest.fixture(scope="function")
